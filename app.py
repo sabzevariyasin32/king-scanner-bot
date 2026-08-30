@@ -1,7 +1,9 @@
+```python
 import os
 import time
 import asyncio
 import hashlib
+import base64
 import requests
 
 from flask import Flask
@@ -21,8 +23,8 @@ VT_API_KEY = os.getenv("VT_API_KEY")
 
 VT_BASE_URL = "https://www.virustotal.com/api/v3"
 
-MAX_SCAN_WAIT = 240
-SCAN_INTERVAL = 20
+MAX_SCAN_WAIT = 120
+SCAN_INTERVAL = 3
 
 
 web_app = Flask(__name__)
@@ -35,134 +37,109 @@ def home():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    web_app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    web_app.run(host="0.0.0.0", port=port)
 
 
 def get_headers():
-    return {
-        "x-apikey": VT_API_KEY
-    }
+    return {"x-apikey": VT_API_KEY}
 
 
-def upload_file_to_virustotal(file_path):
-    url = f"{VT_BASE_URL}/files"
-
-    with open(file_path, "rb") as file:
-        files = {
-            "file": file
-        }
-
-        response = requests.post(
-            url,
-            files=files,
+def get_file_report(file_hash):
+    try:
+        return requests.get(
+            f"{VT_BASE_URL}/files/{file_hash}",
             headers=get_headers(),
-            timeout=60
+            timeout=15
         )
+    except requests.RequestException:
+        return None
 
-    return response
+
+def upload_file(file_path):
+    try:
+        with open(file_path, "rb") as file:
+            return requests.post(
+                f"{VT_BASE_URL}/files",
+                files={"file": file},
+                headers=get_headers(),
+                timeout=60
+            )
+    except requests.RequestException:
+        return None
 
 
 def get_analysis(analysis_id):
-    url = f"{VT_BASE_URL}/analyses/{analysis_id}"
-
-    response = requests.get(
-        url,
-        headers=get_headers(),
-        timeout=30
-    )
-
-    return response
+    try:
+        return requests.get(
+            f"{VT_BASE_URL}/analyses/{analysis_id}",
+            headers=get_headers(),
+            timeout=15
+        )
+    except requests.RequestException:
+        return None
 
 
 def wait_for_analysis(analysis_id):
-    start_time = time.time()
+    start = time.time()
 
-    while time.time() - start_time < MAX_SCAN_WAIT:
-
+    while time.time() - start < MAX_SCAN_WAIT:
         response = get_analysis(analysis_id)
+
+        if response is None:
+            return None, "ارتباط با VirusTotal برقرار نشد."
 
         if response.status_code != 200:
             return None, "خطا در دریافت وضعیت اسکن."
 
-        data = response.json()
-
-        status = (
-            data
-            .get("data", {})
-            .get("attributes", {})
-            .get("status")
+        attributes = response.json().get(
+            "data", {}
+        ).get(
+            "attributes", {}
         )
 
-        if status == "completed":
-            stats = (
-                data
-                .get("data", {})
-                .get("attributes", {})
-                .get("stats", {})
-            )
-
-            return stats, None
+        if attributes.get("status") == "completed":
+            return attributes.get("stats", {}), None
 
         time.sleep(SCAN_INTERVAL)
 
     return None, "زمان اسکن بیش از حد طولانی شد."
 
 
-def get_existing_file_report(file_hash):
-    url = f"{VT_BASE_URL}/files/{file_hash}"
-
-    response = requests.get(
-        url,
-        headers=get_headers(),
-        timeout=30
-    )
-
-    return response
-
-
-def scan_file_with_virustotal(file_path):
-    file_hash = hashlib.sha256()
+def scan_file(file_path):
+    sha256 = hashlib.sha256()
 
     with open(file_path, "rb") as file:
-        while True:
-            chunk = file.read(1024 * 1024)
+        while chunk := file.read(1024 * 1024):
+            sha256.update(chunk)
 
-            if not chunk:
-                break
+    file_hash = sha256.hexdigest()
 
-            file_hash.update(chunk)
+    existing = get_file_report(file_hash)
 
-    sha256 = file_hash.hexdigest()
-
-    existing_response = get_existing_file_report(sha256)
-
-    if existing_response.status_code == 200:
-        data = existing_response.json()
-
-        stats = (
-            data
-            .get("data", {})
-            .get("attributes", {})
-            .get("last_analysis_stats", {})
+    if existing is not None and existing.status_code == 200:
+        stats = existing.json().get(
+            "data", {}
+        ).get(
+            "attributes", {}
+        ).get(
+            "last_analysis_stats", {}
         )
 
         if stats:
             return stats, None
 
-    upload_response = upload_file_to_virustotal(file_path)
+    response = upload_file(file_path)
 
-    if upload_response.status_code != 200:
+    if response is None:
+        return None, "ارتباط با VirusTotal برقرار نشد."
+
+    if response.status_code not in (200, 201):
         return None, "خطا در ارسال فایل به VirusTotal."
 
-    upload_data = upload_response.json()
-
-    analysis_id = (
-        upload_data
-        .get("data", {})
-        .get("id")
+    analysis_id = response.json().get(
+        "data", {}
+    ).get(
+        "id"
     )
 
     if not analysis_id:
@@ -171,107 +148,49 @@ def scan_file_with_virustotal(file_path):
     return wait_for_analysis(analysis_id)
 
 
-async def start(update: Update, context):
-    await update.message.reply_text(
-        "سلام به کینگ اسکنر خوش اومدی\n"
-        "حالا محتوا مورد نظرتو بفرست تا اسکن کنم"
-    )
-
-
-async def scan_file(update: Update, context):
-    document = update.message.document
-
-    file_name = document.file_name
-
-    await update.message.reply_text(
-        f"در حال اسکن {file_name}..."
-    )
-
-    file_obj = await document.get_file()
-
-    os.makedirs("download", exist_ok=True)
-
-    safe_file_name = os.path.basename(file_name)
-
-    file_path = os.path.join(
-        "download",
-        safe_file_name
-    )
+def scan_url_request(url):
+    url_id = base64.urlsafe_b64encode(
+        url.encode()
+    ).decode().rstrip("=")
 
     try:
-        await file_obj.download_to_drive(file_path)
+        existing = requests.get(
+            f"{VT_BASE_URL}/urls/{url_id}",
+            headers=get_headers(),
+            timeout=15
+        )
+    except requests.RequestException:
+        existing = None
 
-        stats, error = await asyncio.to_thread(
-            scan_file_with_virustotal,
-            file_path
+    if existing is not None and existing.status_code == 200:
+        stats = existing.json().get(
+            "data", {}
+        ).get(
+            "attributes", {}
+        ).get(
+            "last_analysis_stats", {}
         )
 
-        if error:
-            await update.message.reply_text(error)
-            return
+        if stats:
+            return stats, None
 
-        malicious = stats.get("malicious", 0)
-        suspicious = stats.get("suspicious", 0)
-        harmless = stats.get("harmless", 0)
-        undetected = stats.get("undetected", 0)
-
-        if malicious > 0:
-            result_text = "مخرب"
-        elif suspicious > 0:
-            result_text = "مشکوک"
-        else:
-            result_text = "سالم"
-
-        message = (
-            f"نتیجه اسکن: {result_text}\n"
-            f"مخرب: {malicious}\n"
-            f"مشکوک: {suspicious}\n"
-            f"سالم: {harmless}\n"
-            f"شناسایی نشده: {undetected}\n"
-            f"نام فایل: {file_name}"
+    try:
+        response = requests.post(
+            f"{VT_BASE_URL}/urls",
+            data={"url": url},
+            headers=get_headers(),
+            timeout=20
         )
+    except requests.RequestException:
+        return None, "ارتباط با VirusTotal برقرار نشد."
 
-        await update.message.reply_text(message)
-
-    except Exception as error:
-        print(f"File scan error: {error}")
-
-        await update.message.reply_text(
-            "خطایی هنگام اسکن فایل رخ داد."
-        )
-
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-
-def submit_url_to_virustotal(url_to_scan):
-    endpoint = f"{VT_BASE_URL}/urls"
-
-    response = requests.post(
-        endpoint,
-        data={
-            "url": url_to_scan
-        },
-        headers=get_headers(),
-        timeout=30
-    )
-
-    return response
-
-
-def scan_url_with_virustotal(url_to_scan):
-    response = submit_url_to_virustotal(url_to_scan)
-
-    if response.status_code != 200:
+    if response.status_code not in (200, 201):
         return None, "خطا در ارسال لینک به VirusTotal."
 
-    data = response.json()
-
-    analysis_id = (
-        data
-        .get("data", {})
-        .get("id")
+    analysis_id = response.json().get(
+        "data", {}
+    ).get(
+        "id"
     )
 
     if not analysis_id:
@@ -280,7 +199,93 @@ def scan_url_with_virustotal(url_to_scan):
     return wait_for_analysis(analysis_id)
 
 
-async def scan_url(update: Update, context):
+def result_text(stats, file_name=None):
+    malicious = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+    harmless = stats.get("harmless", 0)
+    undetected = stats.get("undetected", 0)
+
+    if malicious > 0:
+        result = "مخرب"
+    elif suspicious > 0:
+        result = "مشکوک"
+    else:
+        result = "سالم"
+
+    message = (
+        f"نتیجه اسکن: {result}\n\n"
+        f"مخرب: {malicious}\n"
+        f"مشکوک: {suspicious}\n"
+        f"سالم: {harmless}\n"
+        f"شناسایی نشده: {undetected}"
+    )
+
+    if file_name:
+        message += f"\n\nنام فایل: {file_name}"
+
+    return message
+
+
+async def start(update: Update, context):
+    await update.message.reply_text(
+        "سلام به کینگ اسکنر خوش اومدی\n"
+        "فایل یا لینک مورد نظرتو بفرست تا اسکن کنم."
+    )
+
+
+async def scan_file_handler(update: Update, context):
+    document = update.message.document
+    file_name = document.file_name
+
+    await update.message.reply_text(
+        f"در حال اسکن {file_name}..."
+    )
+
+    file_path = None
+
+    try:
+        file_obj = await document.get_file()
+
+        os.makedirs("download", exist_ok=True)
+
+        safe_name = os.path.basename(file_name)
+
+        file_path = os.path.join(
+            "download",
+            f"{int(time.time())}_{safe_name}"
+        )
+
+        await file_obj.download_to_drive(file_path)
+
+        stats, error = await asyncio.to_thread(
+            scan_file,
+            file_path
+        )
+
+        if error:
+            await update.message.reply_text(error)
+            return
+
+        await update.message.reply_text(
+            result_text(
+                stats,
+                file_name
+            )
+        )
+
+    except Exception as error:
+        print(error)
+
+        await update.message.reply_text(
+            "خطایی هنگام اسکن فایل رخ داد."
+        )
+
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+
+async def scan_url_handler(update: Update, context):
     url = update.message.text.strip()
 
     await update.message.reply_text(
@@ -289,7 +294,7 @@ async def scan_url(update: Update, context):
 
     try:
         stats, error = await asyncio.to_thread(
-            scan_url_with_virustotal,
+            scan_url_request,
             url
         )
 
@@ -297,30 +302,12 @@ async def scan_url(update: Update, context):
             await update.message.reply_text(error)
             return
 
-        malicious = stats.get("malicious", 0)
-        suspicious = stats.get("suspicious", 0)
-        harmless = stats.get("harmless", 0)
-        undetected = stats.get("undetected", 0)
-
-        if malicious > 0:
-            result_text = "لینک مخرب است."
-        elif suspicious > 0:
-            result_text = "لینک مشکوک است."
-        else:
-            result_text = "لینک سالم است."
-
-        message = (
-            f"{result_text}\n"
-            f"مخرب: {malicious}\n"
-            f"مشکوک: {suspicious}\n"
-            f"سالم: {harmless}\n"
-            f"شناسایی نشده: {undetected}"
+        await update.message.reply_text(
+            result_text(stats)
         )
 
-        await update.message.reply_text(message)
-
     except Exception as error:
-        print(f"URL scan error: {error}")
+        print(error)
 
         await update.message.reply_text(
             "خطایی هنگام اسکن لینک رخ داد."
@@ -338,39 +325,38 @@ def main():
             "VT_API_KEY environment variable is not set."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(
+        BOT_TOKEN
+    ).build()
 
     app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start)
     )
 
     app.add_handler(
         MessageHandler(
             filters.Document.ALL,
-            scan_file
+            scan_file_handler
         )
     )
 
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            scan_url
+            scan_url_handler
         )
     )
 
-    print("ربات روشن شد.")
+    print("King Scanner Bot started.")
 
     app.run_polling()
 
 
 if __name__ == "__main__":
-
     Thread(
         target=run_web,
         daemon=True
     ).start()
 
     main()
+```
